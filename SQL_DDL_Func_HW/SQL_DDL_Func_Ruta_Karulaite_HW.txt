@@ -1,0 +1,645 @@
+/*
+SQL_DDL_Func_HW — TASK 6
+Author: Ruta Karulaite
+Date: 2026-11-21
+
+EVIDENCE AND EXECUTION
+
+This analysis uses the actual definitions exported from the student's database:
+- data-1795270692024.csv: nine function definitions from pg_get_functiondef.
+- data-1795270906306.csv: group_concat aggregate, three view definitions,
+  and fourteen last_updated trigger bindings from the PostgreSQL catalogues.
+The database uses timestamptz for payment_date, rental_date and return_date.
+Payment is range-partitioned: historical 2017 months and November 2026 were
+shown in the supplied partition inspection. No August 2026 partition was shown.
+The standard reference dump used during initial development is NOT substituted
+for these exported definitions. In particular, the actual get_customer_balance
+already uses a valid CASE expression; it does NOT have the IF-expression error
+present in some other distributions.
+
+Tasks 1–5 are in the separate .sql submission file and have passed on the
+student's own PostgreSQL 18 database. Replacements and fixture tests below
+were additionally executed twice in PostgreSQL 18.7 via PGlite, using the nine
+exported function definitions and a reproduced partitioned/timestamptz schema
+with full sample data. This verifies code behavior, not the student's live row
+counts or production performance/concurrency. The live run remains a separate
+verification step. No live count is claimed to equal a reference-dataset count.
+
+HOW TO RUN THIS TXT FOR VERIFICATION
+The explanatory part is enclosed in a SQL block comment. Therefore this entire
+TXT can be copied into a new pgAdmin Query Tool tab and executed as SQL.
+The executable section replaces rewards_report and get_customer_balance with
+their EXACT EXPORTED SIGNATURES; it also corrects last_day volatility.
+It commits definitions before the rollback-only fixtures. Test data and a
+fixture-only default partition are removed by ROLLBACK. No IDs are hardcoded.
+The DVD Rental base tables must already exist. Schema core is created if absent.
+Do not execute the original exported definitions afterwards: those would
+reinstall the old versions. No function or dependent view is dropped.
+
+1. WHAT OPERATIONS DO THE SEVEN FUNCTIONS PERFORM?
+
+1.1 film_in_stock(integer, integer, OUT p_film_count integer)
+The actual SQL body selects inventory_id from inventory, filters film_id=$1
+and store_id=$2, and requires inventory_in_stock(inventory_id) to be true.
+It returns available physical COPY IDs, one integer per matching copy.
+It never executes COUNT. Although the OUT column is named p_film_count, each
+value is an inventory ID, not the number of copies. For a count, use
+SELECT count(*) FROM public.film_in_stock(film_id,store_id).
+Unknown film/store IDs give no rows because inventory has no match. No input
+validation is performed. Its unqualified names rely on the caller's search_path.
+
+1.2 film_not_in_stock(integer, integer, OUT p_film_count integer)
+It uses the same inventory film/store filters but tests
+NOT inventory_in_stock(inventory_id). It returns unavailable COPY IDs.
+A film with no inventory returns an empty set; there is no inventory row to
+emit. It does not return the film itself as an out-of-stock catalogue entry.
+The same misleading OUT name and unqualified references apply.
+
+1.3 inventory_in_stock(integer)
+First query: SELECT count(*) FROM rental WHERE inventory_id=p_inventory_id.
+If that count is zero, the function immediately returns TRUE.
+Otherwise it counts rental_id in inventory LEFT JOIN rental USING(inventory_id),
+filtered by the requested inventory and return_date IS NULL. A positive count
+returns FALSE; otherwise it returns TRUE. Consequently, any open rental makes
+the copy unavailable, even if some other rental of the same copy was returned.
+Concrete defect: a nonexistent inventory ID also has zero rental rows and
+returns TRUE. NULL similarly matches no rental and returns TRUE. There is no
+inventory-existence check. Two full counts can be replaced by an existence
+check and NOT EXISTS over open rentals, after defining invalid-ID behavior.
+The function is not removed here because other functions depend on its API.
+
+1.4 get_customer_balance(integer, timestamp with time zone)
+The actual body performs three aggregates and returns their arithmetic sum:
+- Sum film.rental_rate for this customer's rentals with rental_date<=cutoff,
+  joining rental -> inventory -> film.
+- Sum CASE WHEN (return_date-rental_date)>rental_duration*interval '1 day'
+  THEN EXTRACT(epoch FROM ((return_date-rental_date)
+       -rental_duration*interval '1 day'))::INTEGER / 86400 ELSE 0 END.
+- Sum payment.amount with payment_date<=cutoff for the customer.
+Return expression: v_rentfees + v_overfees - v_payments.
+Thus it charges current catalogue rental fees, whole-day late fees for returned
+rentals, and subtracts earlier payments. The CASE is valid PostgreSQL SQL.
+It never references replacement_cost, although its own rule 3 requires it.
+An unreturned rental has NULL return_date; the WHEN condition is unknown and
+ELSE 0 applies, so it incorrectly incurs no overdue fees. A return later than
+the cutoff is still used in full: the cutoff filters rental_date, not return_date.
+The ::INTEGER cast rounds fractional seconds before integer division; a value
+just below a whole day can be rounded up across the 86400-second boundary.
+The bounded DECIMAL(5,2) fee/payment variables also overflow above 999.99.
+Unknown/NULL customer parameters are not validated. Current film prices are
+used, so the schema cannot reconstruct historical charges after price changes.
+
+1.5 inventory_held_by_customer(integer)
+SELECT customer_id INTO v_customer_id FROM rental
+WHERE return_date IS NULL AND inventory_id=p_inventory_id;
+RETURN v_customer_id.
+No matching open rental yields NULL. A nonexistent copy also yields NULL.
+If multiple open rentals exist, non-STRICT SELECT INTO silently chooses one
+unspecified matching row. The body does not detect this anomaly. Whether the
+schema prevents it depends on constraints/indexes not included in these exports.
+A partial unique index on rental(inventory_id) WHERE return_date IS NULL would
+prevent multiple open rentals after existing conflicts are resolved.
+
+1.6 rewards_report(integer, numeric)
+The exported function is LANGUAGE plpgsql SECURITY DEFINER. It checks only
+min_monthly_purchases=0 and min_dollar_amount_purchased=0.00. Negative and NULL
+values are not rejected. It calculates CURRENT_DATE - interval '3 month',
+constructs that month's first date with extract/text/to_date, and calls LAST_DAY
+for its end. Despite the last_month variable names, this means THREE months ago.
+It creates temporary tmpCustomer(customer_id INTEGER PRIMARY KEY).
+tmpSQL contains an INSERT ... SELECT customer_id FROM payment with
+DATE(payment_date) BETWEEN month_start AND month_end, GROUP BY customer_id,
+HAVING SUM(amount)>minimum_amount AND COUNT(customer_id)>minimum_purchases.
+EXECUTE runs that string. A FOR rr IN EXECUTE loop joins customer to tmpCustomer,
+RETURN NEXT emits the rows, and a final EXECUTE drops the temporary table.
+It counts PAYMENT rows, not distinct rentals. It includes active and inactive
+customers alike because no active/store condition exists.
+Using > excludes customers whose values exactly equal the stated minimum.
+
+1.7 last_day(timestamp with time zone)
+Actual declaration: LANGUAGE sql IMMUTABLE STRICT, returns date.
+EXTRACT(MONTH FROM $1)=12 builds next January 1 using EXTRACT(YEAR)+1;
+other months build the first date of month+1. It subtracts one day and returns
+the date. This handles normal leap-year and December boundaries; STRICT makes
+NULL return NULL without running the body. rewards_report calls this utility.
+However, EXTRACT(MONTH/YEAR FROM timestamptz) depends on the session TimeZone.
+The SAME instant, '2024-01-31 23:30+00', is January in UTC but February in
+Europe/Vilnius. The exported function returns January 31 in UTC and February 29
+in Vilnius. Therefore IMMUTABLE is incorrect; STABLE matches its real behavior.
+The replacement below preserves this session-local calendar policy and exact
+signature, simplifies the month-end calculation and declares STABLE STRICT.
+
+2. WHY DOES rewards_report RETURN ZERO ROWS? HOW IS IT CORRECTED?
+
+On 2026-11-21 the body selects 2026-08-01 through 2026-08-31. The student's
+partition listing shows historical 2017 partitions and November 2026, with no
+August 2026 partition. Hence the selected period has no matching payments in
+that inspected dataset; tmpCustomer is empty and the RETURN NEXT loop emits
+nothing. An empty result is not itself a syntax error. High thresholds can
+also legitimately produce no rewardees in a populated month.
+
+The correction adds core.rewards_report_for_month(min_count,min_amount,month).
+The optional month defaults to the latest month represented in payment.
+This explicit teaching-dataset policy yields useful historical reports without
+hardcoding a year, customer or ID. The latest month may be incomplete. NULL
+means the same default. An explicit date selects that date's calendar month.
+For a production previous-calendar-month report, pass that month explicitly:
+(date_trunc('month',CURRENT_DATE)-interval '1 month')::date.
+Returning no rows is then correct if that month has no payments.
+
+public.rewards_report(integer,numeric) is replaced with a wrapper using exactly
+its existing signature. Its default reporting policy deliberately changes from
+three months ago to latest available month; this is documented in its comment.
+No new defaulted overload of that original name makes existing calls ambiguous.
+Thresholds must be finite and positive, with NULL/negative/zero values rejected
+using RAISE EXCEPTION SQLSTATE 22023. >= implements inclusive minimums.
+Static RETURN QUERY uses [month_start,next_month_start), avoids casting every
+payment_date to DATE, and returns customer rows via a grouped subquery.
+Calendar boundaries use the session TimeZone; the actual timestamp type is
+retained. No data at all yields NOTICE and an empty set, not a bogus customer.
+SECURITY INVOKER avoids elevated owner rights. Missing tables or privileges
+retain their original PostgreSQL diagnostics rather than being hidden.
+
+Valid test: default period and explicitly supplied max(payment_date)::date
+must yield the same customer set. Edge tests: missing month data -> zero rows;
+zero purchase threshold or NULL amount -> caught 22023. The rollback fixture
+proves exact minimum thresholds qualify after adding one $7 test payment to any
+existing January activity. Counts and spending thresholds include that baseline.
+Live report counts depend on the actual data and are not hardcoded in this answer.
+
+3. WHICH FUNCTION CAN POTENTIALLY BE REMOVED?
+
+The catalogue export confirms public.group_concat has transition function
+_group_concat(text,text), text state and NULL initial state. PostgreSQL already
+provides string_agg, so this custom aggregate/helper pair is a candidate for
+replacement. _group_concat repeatedly concatenates the entire accumulated text
+with ', ' and another value; repeated allocation/copying can become costly for
+large groups. No measured speedup is claimed without benchmarking.
+Replace each actual dependent view with equivalent string_agg calls, including
+DISTINCT and explicit ORDER BY where required, then remove the aggregate and
+helper AFTER checking dependencies. Do not DROP ... CASCADE blindly.
+NULL/empty inputs, delimiters, ordering and DISTINCT must be verified, not assumed.
+
+last_day is also expressible inline with date_trunc plus an interval, but a named
+utility is reasonable for reuse. Correcting its volatility is more useful here
+than deleting it. film_in_stock/not_in_stock return complementary sets, so they
+are not duplicates merely because their filters look similar.
+
+4. WHICH FUNCTIONS VIOLATE BEST PRACTICES?
+
+rewards_report: unnecessary dynamic SQL and temporary table; row-by-row result
+loop; =0-only validation; strict > for minimums; clock-dependent old-data period;
+DATE(payment_date) filter may inhibit simple index use/partition pruning compared
+to direct timestamp bounds. SECURITY DEFINER plus unqualified objects and no
+fixed safe search_path adds avoidable privilege/name-resolution risk. The fix
+uses invoker rights, qualified relations and SET search_path=pg_catalog.
+
+get_customer_balance: body omits a documented replacement-cost rule, skips open
+rental late fees, leaks later return dates into past balances, uses fixed small
+numeric locals, and rounds seconds before division. Its exported CASE is valid,
+so calling it syntactically broken would be incorrect for this database.
+
+last_day: IMMUTABLE misrepresents a timestamptz computation dependent on TimeZone.
+A planner may pre-evaluate/cache a result under one zone that is not valid in
+another. It should be STABLE for this policy.
+
+inventory_in_stock: unknown/NULL copy -> TRUE; two counts instead of existence
+logic. inventory_held_by_customer: no explicit detection of multiple open rows.
+film_in_stock/not_in_stock: misleading OUT parameter name and per-copy helper
+calls; unqualified relation/function references. A set-based anti-join can reduce
+per-row work on large candidate sets, but should be measured.
+_group_concat: repeated string copying and no inherent output order. Affected
+view calls do not specify ORDER BY. last_updated updates the audit value even
+for a no-op business UPDATE; transaction-start time is appropriate only if that
+is the intended audit policy. These are concrete tradeoffs, not proof all small
+helpers or procedural functions should be removed.
+
+5. COMPLETE get_customer_balance ACCORDING TO ITS COMMENTS
+
+The four comments require rental fees + $1/day overdue + replacement cost when
+more than rental_duration*2 overdue - earlier payments. The replacement below
+implements these with the original timestamptz signature, not a new timestamp
+without time zone overload.
+
+For each rental beginning at/before the cutoff:
+end_time = least(coalesce(return_date,cutoff),cutoff)
+overdue_days = greatest(0,floor((end_time-rental_date-duration*24 hours)/86400 sec))
+charge = rental_rate + overdue_days
+       + replacement_cost when overdue_days > 2*rental_duration.
+The final result subtracts payments whose payment_date<=cutoff.
+
+Policy choices are explicit: completed 24-hour overdue days, not rounded calendar
+changes; replacement is ADDED to late fees; "more than duration*2 overdue" means
+overdue days, not total borrowing days. For a three-day rental, replacement starts
+at seven completed overdue days. A different business interpretation would need
+a changed formula. Using 24-hour durations makes the day definition independent
+of daylight-saving transitions. The test sets UTC for reproducible fixtures.
+
+This caps future returns at the cutoff and accrues open rentals to that cutoff.
+A known customer with no activity returns 0. Payments exceeding calculated charges
+produce a negative credit balance. NULL/unknown customer or NULL/infinite date
+raises 22023. Numeric sums have no artificial 999.99 local-variable ceiling.
+Underlying database/permission errors propagate; no catch-all masks them.
+
+Limitation: film holds current rental_rate/replacement_cost, not a rental-time
+price history. Neither the original nor this replacement can reconstruct a price
+that was never recorded. This is a balance snapshot, not a posting operation;
+calling it twice does not bill the customer twice or modify payment/rental data.
+
+Hand-calculated valid fixture: four existing rentals temporarily set to rate
+4.99 and duration three days, with a baseline for the customer's other activity.
+Returned late: 2 overdue days; return after cutoff: 15 days; still open: 15 days;
+not overdue: 0. Two replacement charges at 19.99. A payment of 7 precedes the
+cutoff and a future payment of 50 does not. Expected result:
+4*4.99 + (2+15+15+0) + 2*19.99 - 7 = an increase of 84.94 over the captured
+baseline. Existing activity is not assumed absent. The earlier balance must stay
+unchanged. NULL customer and NULL date must raise 22023. The test reuses existing
+customer, inventory, rental and payment rows; it never generates IDs or resets
+sequences. Every fixture update, including temporary prices, is rolled back.
+
+6. HOW group_concat AND _group_concat WORK, AND WHERE THEY ARE USED
+
+The exported catalogue binding is:
+transition=_group_concat(text,text); state=text; initial=NULL.
+For each input row the aggregate calls the transition function with the current
+state $1 and incoming value $2. Its actual CASE returns $1 when $2 IS NULL;
+returns $2 when $1 IS NULL; otherwise returns $1 || ', ' || $2.
+Example 'A', NULL, 'B' -> 'A, B'. An empty/all-NULL group stays NULL; an empty
+string is a real value, not NULL. The transition helper is correctly IMMUTABLE
+because it depends only on the two text inputs. It is intentionally not STRICT:
+the initial NULL state must be processed to accept the first non-NULL input.
+The helper does not implement DISTINCT or ordering: aggregate callers decide those.
+
+The SECOND CSV verifies exactly these dependent view definitions:
+- actor_info: inner group_concat(f.title) gathers an actor's films within a
+  category; outer group_concat(DISTINCT category-name || ': ' || film-list)
+  combines category fragments per actor.
+- film_list: group_concat(actor.first_name || ' ' || actor.last_name) builds
+  each film's actor list, grouped with film/category attributes.
+- nicer_but_slower_film_list: group_concat of upper(first character) and
+  lower(rest) components for actor first and last names. The actual expression
+  concatenates them WITHOUT a space, so names can look like 'PenelopeGuiness'.
+None of these supplied aggregate calls specifies ORDER BY. DISTINCT in the
+outer actor_info call removes duplicates but does not define a promised order.
+
+7. WHAT last_updated DOES, AND WHERE IT IS USED
+
+The body assigns NEW.last_update=CURRENT_TIMESTAMP and RETURN NEW.
+The exported trigger definitions attach it BEFORE UPDATE FOR EACH ROW on:
+actor, address, category, city, country, customer, film, film_actor,
+film_category, inventory, language, rental, staff, store — fourteen tables.
+The function modifies the row about to be written; it does not issue a separate
+UPDATE and it is not an automatically global database trigger. There is no
+payment binding among these exported last_updated triggers. INSERT defaults
+are separate from these BEFORE UPDATE bindings.
+CURRENT_TIMESTAMP is the TRANSACTION START instant, so rows updated within one
+transaction can share an audit timestamp even if wall-clock time has advanced.
+It overwrites a manually supplied NEW.last_update too and runs on no-op updates.
+A different film full-text trigger is not this function.
+
+8. WHAT IS tmpSQL FOR? CAN EXECUTE BE REMOVED?
+
+tmpSQL first stores the INSERT INTO tmpCustomer ... SELECT ... text, assembled
+with quote_literal(month dates) and concatenated numeric thresholds. EXECUTE
+runs it. Later tmpSQL='DROP TABLE tmpCustomer' is executed. The FOR loop uses
+another fixed SELECT string directly. Table names and projection never change;
+only dates and thresholds are variable VALUES. These do not require dynamic SQL.
+Static SQL can use PL/pgSQL parameters directly. A grouped RETURN QUERY removes
+the temporary ID table, the EXECUTE statements and the row loop altogether.
+
+If a numeric threshold is NULL, concatenation with || produces NULL tmpSQL and
+EXECUTE can fail with a NULL-query-string error. Validation should reject input
+first. The numeric parameters are not arbitrary text identifiers, so there is
+no need to invent a text-injection exploit to explain why dynamic SQL is needless.
+Dynamic SQL would be justified for runtime identifiers, which this body lacks.
+
+9. CAN ANY FUNCTION PRODUCE INCORRECT RESULTS? CONCRETE CASES
+
+- inventory_in_stock(NULL) or an absent inventory ID -> TRUE, because the first
+  count is zero and the function exits before checking inventory existence.
+- get_customer_balance treats open rentals as zero late fees, ignores replacement
+  charges and uses a future return_date for a past cutoff. Its current-price join
+  also cannot reproduce a historical price after catalogue changes.
+- Its EXTRACT(epoch)::INTEGER can round 86399.6 seconds to 86400 before division,
+  counting a full overdue day although 24 hours have not elapsed. Long intervals
+  may exceed the cast's 32-bit integer range; large sums can overflow DECIMAL(5,2).
+- inventory_held_by_customer chooses an unspecified row if multiple open rentals
+  exist. The function alone does not guarantee a single matching record.
+- rewards_report excludes exact minimum values because it uses >, selects three
+  months ago regardless of the data, and can fail on NULL thresholds. No rows
+  are correct when the selected month genuinely has no qualifying payments.
+- last_day gives different month ends for the SAME timestamptz under different
+  TimeZone settings while claiming IMMUTABLE. That declaration is wrong for its
+  intended local-month interpretation; the STABLE replacement addresses it.
+- Interpreting film_in_stock's p_film_count values as a count is wrong: they are IDs.
+- group_concat returns an unspecified ordering; relying on fixed ordering is wrong.
+  The supplied nicer_but_slower_film_list expression also omits a name separator.
+- Interpreting last_updated as per-row wall-clock time is wrong because it uses
+  transaction-start CURRENT_TIMESTAMP. Its actual code works as declared.
+
+No speculative observations from a different distribution are presented as
+facts about the exported definitions. No destructive cleanup of existing data
+or automatic removal of dependent functions/views is performed.
+
+EXECUTABLE REPLACEMENTS AND TESTS FOLLOW
+The definitions are rerunnable CREATE OR REPLACE. Expected errors in tests are
+caught by SQLSTATE; unexpected failures stop execution. Existing database data
+is preserved after fixture ROLLBACK. This Task 6 fixture does not request any
+sequence values. The DEFAULT fixture partition exists only inside that transaction.
+The report queries after ROLLBACK read real data and may return different counts
+than another installation. The optional-month comparison must return true.
+
+*/
+
+-- Task 6 replacements: execute this section separately, after reviewing the analysis.
+-- Schema core is shared with tasks 1–5. No original function is dropped.
+BEGIN;
+CREATE SCHEMA IF NOT EXISTS core;
+-- A report period is business input, not SQL syntax; static SQL is sufficient.
+-- NULL/omitted month means the latest month represented in payment, not wall clock.
+-- This is an explicit historical-dataset policy; the latest month may be partial.
+-- Use an explicit first-of-month date for reproducible reports.
+CREATE OR REPLACE FUNCTION core.rewards_report_for_month(
+    p_min_purchases integer,
+    p_min_amount numeric,
+    p_month date DEFAULT NULL)
+RETURNS SETOF public.customer
+LANGUAGE plpgsql STABLE SECURITY INVOKER
+SET search_path = pg_catalog
+AS $$
+DECLARE v_month timestamp with time zone;
+BEGIN
+    IF p_min_purchases IS NULL OR p_min_purchases <= 0
+       OR p_min_amount IS NULL OR NOT (p_min_amount > 0 AND p_min_amount < 'Infinity'::numeric) THEN
+        RAISE EXCEPTION 'Purchase and amount thresholds must be finite and positive'
+            USING ERRCODE='22023';
+    END IF;
+    IF p_month IS NOT NULL AND NOT isfinite(p_month) THEN
+        RAISE EXCEPTION 'Month must be a finite date' USING ERRCODE='22023';
+    END IF;
+    IF p_month IS NULL THEN
+        SELECT date_trunc('month', max(p.payment_date)) INTO v_month FROM public.payment p;
+    ELSE
+        v_month := date_trunc('month',p_month::timestamp);
+    END IF;
+    IF v_month IS NULL THEN
+        RAISE NOTICE 'No payment data: no rewardees'; RETURN;
+    END IF;
+    RETURN QUERY
+    SELECT c.* FROM public.customer c
+    JOIN (
+        SELECT p.customer_id FROM public.payment p
+        WHERE p.payment_date >= v_month AND p.payment_date < v_month+interval '1 month'
+        GROUP BY p.customer_id
+        HAVING count(*) >= p_min_purchases AND sum(p.amount) >= p_min_amount
+    ) qualified ON qualified.customer_id=c.customer_id;
+    -- >= implements MINIMUM inclusive thresholds; original > excludes exact matches.
+    -- No temp table, dynamic EXECUTE, concatenation, row loop or elevated privileges.
+END;
+$$;
+
+COMMENT ON FUNCTION core.rewards_report_for_month(integer,numeric,date) IS
+'Parameterized monthly rewardees, inclusive thresholds. Month defaults to latest payment month; NULL/absent data returns empty. Static SQL, invoker privileges, month boundaries in session time zone.';
+
+-- Preserve the exact original two-argument signature, so dependencies still work.
+-- Existing callers now receive latest-available-month results, explicitly documented.
+CREATE OR REPLACE FUNCTION public.rewards_report(
+    min_monthly_purchases integer, min_dollar_amount_purchased numeric)
+RETURNS SETOF public.customer
+LANGUAGE sql STABLE SECURITY INVOKER
+SET search_path = pg_catalog
+AS $$
+    SELECT * FROM core.rewards_report_for_month($1,$2);
+$$;
+COMMENT ON FUNCTION public.rewards_report(integer,numeric) IS
+'Inclusive minimum thresholds, latest available payment month (possibly partial). Explicit periods: core.rewards_report_for_month(min_count,min_amount,date). SECURITY INVOKER; static SQL.';
+
+-- Full balance requirements from ORIGINAL function comments, implemented below.
+-- Define overdue days as completed 24-hour days AFTER the rental due timestamp.
+-- Replacement threshold means overdue_days > 2*rental_duration (literal wording
+-- "more than rental_duration*2 overdue"), not total borrowing days > 2*duration.
+-- Replacement cost is ADDED to rental and daily late fees as comments list charges
+-- separately. These two policy choices must be confirmed for a production system.
+CREATE OR REPLACE FUNCTION public.get_customer_balance(
+    p_customer_id integer, p_effective_date timestamp with time zone)
+RETURNS numeric
+LANGUAGE plpgsql STABLE SECURITY INVOKER
+SET search_path = pg_catalog
+AS $$
+DECLARE v_charges numeric; v_payments numeric;
+BEGIN
+    IF p_customer_id IS NULL OR p_effective_date IS NULL OR NOT isfinite(p_effective_date) THEN
+        RAISE EXCEPTION 'Customer and finite effective date are required' USING ERRCODE='22023';
+    END IF;
+    IF NOT EXISTS(SELECT 1 FROM public.customer c WHERE c.customer_id=p_customer_id) THEN
+        RAISE EXCEPTION 'Customer does not exist: %',p_customer_id USING ERRCODE='22023';
+    END IF;
+    WITH borrowing AS (
+        SELECT f.rental_rate, f.rental_duration, f.replacement_cost,
+            greatest(0, floor(extract(epoch FROM
+                (least(coalesce(r.return_date,p_effective_date),p_effective_date)
+                 - r.rental_date - f.rental_duration * interval '24 hours')) / 86400)) AS overdue_days
+        FROM public.rental r
+        JOIN public.inventory i ON i.inventory_id=r.inventory_id
+        JOIN public.film f ON f.film_id=i.film_id
+        WHERE r.customer_id=p_customer_id AND r.rental_date<=p_effective_date
+    )
+    SELECT coalesce(sum(rental_rate + overdue_days
+             + CASE WHEN overdue_days > rental_duration * 2 THEN replacement_cost ELSE 0 END),0)
+    INTO v_charges FROM borrowing;
+    SELECT coalesce(sum(p.amount),0) INTO v_payments FROM public.payment p
+    WHERE p.customer_id=p_customer_id AND p.payment_date<=p_effective_date;
+    RETURN v_charges-v_payments;
+    -- No rentals/payments => 0; payments exceeding charges => negative customer credit.
+    -- No catch-all handler: missing tables/permissions propagate original diagnostics.
+END;
+$$;
+COMMENT ON FUNCTION public.get_customer_balance(integer,timestamp with time zone) IS
+'As-of balance: rental fees + completed overdue days + replacement for >2*duration overdue days - payments. Caps return date at effective date, handles unreturned rentals, validates customer. Current film prices are used because price history is absent.';
+-- The supplied last_day(timestamptz) depends on TimeZone and is therefore STABLE,
+-- not IMMUTABLE. This replacement also avoids text construction of dates.
+CREATE OR REPLACE FUNCTION public.last_day(timestamp with time zone)
+RETURNS date LANGUAGE sql STABLE STRICT
+SET search_path = pg_catalog
+AS $$
+    SELECT (date_trunc('month',$1) + interval '1 month' - interval '1 day')::date;
+$$;
+COMMENT ON FUNCTION public.last_day(timestamp with time zone) IS
+'Last date of the month in the session TimeZone; STABLE because the same instant can belong to different local months. NULL input returns NULL.';
+COMMIT;
+
+
+-- Tests: expected invalid-input exceptions are caught; all fixture writes roll back.
+BEGIN;
+SET LOCAL TIME ZONE 'UTC';
+SET LOCAL client_min_messages=notice;
+-- Match partitioned payment: rollback removes this fixture partition and its rows.
+DO $$ BEGIN
+    IF (SELECT relkind='p' FROM pg_class WHERE oid='public.payment'::regclass)
+       AND NOT EXISTS(SELECT 1 FROM pg_inherits x JOIN pg_class c ON c.oid=x.inhrelid
+           WHERE x.inhparent='public.payment'::regclass
+           AND pg_get_expr(c.relpartbound,c.oid)='DEFAULT') THEN
+        CREATE TABLE core._func_hw_payment_fixture PARTITION OF public.payment DEFAULT;
+    END IF;
+END $$;
+DO $$
+DECLARE
+    v_customer integer;
+    v_rentals integer[];
+    v_p1 public.payment%ROWTYPE;
+    v_p2 public.payment%ROWTYPE;
+    v_actual numeric;
+    v_baseline numeric;
+    v_before_activity numeric;
+    v_paycount integer;
+    v_paysum numeric;
+    v_count bigint;
+BEGIN
+    -- Reuse existing rows: no customer/inventory/rental/payment ID is generated.
+    -- Choose a customer with four distinct available copies and linked payments.
+    SELECT c.customer_id INTO v_customer
+    FROM public.customer c
+    WHERE (
+        SELECT count(DISTINCT r.inventory_id) FROM public.rental r
+        WHERE r.customer_id=c.customer_id
+          AND NOT EXISTS(SELECT 1 FROM public.rental o
+                         WHERE o.inventory_id=r.inventory_id AND o.return_date IS NULL)
+          AND EXISTS(SELECT 1 FROM public.payment p
+                     WHERE p.rental_id=r.rental_id AND p.customer_id=c.customer_id)
+    ) >= 4
+    ORDER BY c.customer_id LIMIT 1;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Fixture requires one customer with four paid rentals of distinct available copies';
+    END IF;
+
+    SELECT array_agg(q.rental_id ORDER BY q.inventory_id) INTO v_rentals
+    FROM (
+        SELECT DISTINCT ON (r.inventory_id) r.rental_id,r.inventory_id
+        FROM public.rental r
+        WHERE r.customer_id=v_customer
+          AND NOT EXISTS(SELECT 1 FROM public.rental o
+                         WHERE o.inventory_id=r.inventory_id AND o.return_date IS NULL)
+          AND EXISTS(SELECT 1 FROM public.payment p
+                     WHERE p.rental_id=r.rental_id AND p.customer_id=v_customer)
+        ORDER BY r.inventory_id,r.rental_id LIMIT 4
+    ) q;
+
+    SELECT p.* INTO STRICT v_p1 FROM public.payment p
+    WHERE p.customer_id=v_customer AND p.rental_id=ANY(v_rentals)
+    ORDER BY p.payment_date,p.payment_id LIMIT 1;
+    SELECT p.* INTO STRICT v_p2 FROM public.payment p
+    WHERE p.customer_id=v_customer AND p.rental_id=ANY(v_rentals)
+      AND (p.payment_id,p.payment_date)<>(v_p1.payment_id,v_p1.payment_date)
+    ORDER BY p.payment_date,p.payment_id LIMIT 1;
+
+    -- Set controlled prices and move only the chosen rental/payment rows beyond
+    -- the cutoff BEFORE capturing baselines. Other customer activity may exist.
+    -- These are transactional fixture updates; ROLLBACK restores every old value.
+    UPDATE public.film f
+    SET rental_rate=4.99,rental_duration=3,replacement_cost=19.99
+    WHERE f.film_id IN (
+        SELECT i.film_id FROM public.inventory i JOIN public.rental r USING(inventory_id)
+        WHERE r.rental_id=ANY(v_rentals));
+    UPDATE public.rental r
+    SET rental_date=timestamptz '2030-01-01 00:00+00'+q.ord*interval '1 hour',
+        return_date=timestamptz '2030-01-02 00:00+00'+q.ord*interval '1 hour'
+    FROM unnest(v_rentals) WITH ORDINALITY q(id,ord)
+    WHERE r.rental_id=q.id;
+    UPDATE public.payment p SET payment_date=timestamptz '2031-01-01 00:00+00'
+    WHERE p.customer_id=v_customer AND p.payment_id=v_p1.payment_id
+      AND p.payment_date=v_p1.payment_date;
+    UPDATE public.payment p SET payment_date=timestamptz '2031-01-02 00:00+00'
+    WHERE p.customer_id=v_customer AND p.payment_id=v_p2.payment_id
+      AND p.payment_date=v_p2.payment_date;
+    v_baseline:=public.get_customer_balance(v_customer,timestamptz '2020-01-20 00:00+00');
+    v_before_activity:=public.get_customer_balance(v_customer,timestamptz '2019-01-01 00:00+00');
+    SELECT count(*)::integer,coalesce(sum(p.amount),0) INTO v_paycount,v_paysum
+    FROM public.payment p WHERE p.customer_id=v_customer
+      AND p.payment_date>=timestamptz '2020-01-01 00:00+00'
+      AND p.payment_date<timestamptz '2020-02-01 00:00+00';
+
+    UPDATE public.rental SET rental_date='2020-01-01 00:00+00',return_date='2020-01-06 00:00+00'
+    WHERE rental_id=v_rentals[1];
+    UPDATE public.rental SET rental_date='2020-01-01 01:00+00',return_date='2020-01-30 00:00+00'
+    WHERE rental_id=v_rentals[2];
+    UPDATE public.rental SET rental_date='2020-01-01 02:00+00',return_date=NULL
+    WHERE rental_id=v_rentals[3];
+    UPDATE public.rental SET rental_date='2020-01-19 00:00+00',return_date='2020-01-20 00:00+00'
+    WHERE rental_id=v_rentals[4];
+    UPDATE public.payment p SET amount=7,payment_date='2020-01-10 00:00+00'
+    WHERE p.customer_id=v_customer AND p.payment_id=v_p1.payment_id
+      AND p.payment_date=timestamptz '2031-01-01 00:00+00';
+    UPDATE public.payment p SET amount=50,payment_date='2020-02-01 00:00+00'
+    WHERE p.customer_id=v_customer AND p.payment_id=v_p2.payment_id
+      AND p.payment_date=timestamptz '2031-01-02 00:00+00';
+
+    -- 4*4.99 + (2+15+15+0) + 2*19.99 - 7 = 84.94 above the baseline.
+    v_actual:=public.get_customer_balance(v_customer,timestamptz '2020-01-20 00:00+00');
+    IF v_actual IS DISTINCT FROM v_baseline+84.94 THEN
+        RAISE EXCEPTION 'Balance increase expected 84.94, actual %',v_actual-v_baseline;
+    END IF;
+    -- Exact minima include existing January activity, if any, plus one $7 payment.
+    SELECT count(*) INTO v_count
+    FROM core.rewards_report_for_month(v_paycount+1,v_paysum+7,date '2020-01-01') r
+    WHERE r.customer_id=v_customer;
+    IF v_count<>1 THEN RAISE EXCEPTION 'Inclusive reward threshold test failed'; END IF;
+    IF public.get_customer_balance(v_customer,timestamptz '2019-01-01 00:00+00')
+       IS DISTINCT FROM v_before_activity THEN
+        RAISE EXCEPTION 'Fixture affected a balance before the test activity';
+    END IF;
+    BEGIN
+        PERFORM public.get_customer_balance(NULL,timestamptz '2020-01-20 00:00+00');
+        RAISE EXCEPTION 'NULL customer unexpectedly accepted';
+    EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+    BEGIN
+        PERFORM public.get_customer_balance(v_customer,NULL);
+        RAISE EXCEPTION 'NULL date unexpectedly accepted';
+    EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+    BEGIN
+        PERFORM core.rewards_report_for_month(0,1,date '2020-01-01');
+        RAISE EXCEPTION 'Zero purchase threshold unexpectedly accepted';
+    EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+    BEGIN
+        PERFORM core.rewards_report_for_month(1,NULL,date '2020-01-01');
+        RAISE EXCEPTION 'NULL threshold unexpectedly accepted';
+    EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+    RAISE NOTICE 'PASS Task 6: balance increase 84.94, historical cutoff, open rental, replacement, exact reward thresholds and invalid inputs';
+END $$;
+DO $$
+DECLARE v_utc date; v_vilnius date;
+BEGIN
+    IF public.last_day(timestamptz '2024-02-10 12:00+00') <> date '2024-02-29'
+       OR public.last_day(NULL::timestamptz) IS NOT NULL THEN
+        RAISE EXCEPTION 'last_day leap-year/NULL test failed';
+    END IF;
+    -- Same instant is January in UTC and February in Vilnius.
+    v_utc := public.last_day(timestamptz '2024-01-31 23:30+00');
+    PERFORM set_config('TimeZone','Europe/Vilnius',true);
+    v_vilnius := public.last_day(timestamptz '2024-01-31 23:30+00');
+    IF v_utc <> date '2024-01-31' OR v_vilnius <> date '2024-02-29' THEN
+        RAISE EXCEPTION 'last_day local-month test failed: %, %',v_utc,v_vilnius;
+    END IF;
+    RAISE NOTICE 'PASS Task 6: last_day leap year, NULL and session time zone';
+END $$;
+ROLLBACK;
+
+
+-- Real-data checks: rows/counts vary with the user's database; no fixed IDs/dates.
+SELECT count(*) AS rewardees_in_latest_available_month
+FROM public.rewards_report(1,1);
+SELECT count(*) AS rewardees_in_earliest_available_month
+FROM core.rewards_report_for_month(1,1,
+    (SELECT min(payment_date)::date FROM public.payment));
+-- Valid period without rows in the known teaching data: expected 0.
+SELECT count(*) AS rewardees_in_empty_month
+FROM core.rewards_report_for_month(1,1,date '9999-01-01');
+-- Defaulted period and an explicitly supplied latest month must return identical sets.
+SELECT NOT EXISTS(
+ (SELECT customer_id FROM public.rewards_report(1,1)
+  EXCEPT SELECT customer_id FROM core.rewards_report_for_month(1,1,
+      (SELECT max(payment_date)::date FROM public.payment)))
+ UNION ALL
+ (SELECT customer_id FROM core.rewards_report_for_month(1,1,
+      (SELECT max(payment_date)::date FROM public.payment))
+  EXCEPT SELECT customer_id FROM public.rewards_report(1,1))
+) AS rewards_optional_month_matches; -- expected true
