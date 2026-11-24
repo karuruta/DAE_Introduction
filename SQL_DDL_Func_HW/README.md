@@ -66,9 +66,7 @@ sequences when generating fixture IDs; ID gaps after rollback are normal.
 The revised Task 6 fixture reuses existing rows and does not request IDs, so even
 stale sequences do not cause a duplicate-key error. It does not reset sequences.
 
-The stock function reports the latest **historical** customer/rental date for each
-available inventory copy. The output rental date is explicitly converted to the
-session-local timestamp, preserving its existing return signature.
+The stock function returns one row per available copy without an open rental. Customer and rental date are NULL. If no copy matches, it returns one message row. The popularity function returns all films tied for first place by rental count and keeps one row with NULL film details for a country without rentals.
 
 `new_movie` defaults to the current year and Klingon, but validates that the language
 exists. Missing Klingon raises an explicit error. Tests add it only temporarily.

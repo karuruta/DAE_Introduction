@@ -77,88 +77,72 @@ FROM core.get_sales_revenue_by_category_qtr();
 COMMENT ON VIEW core.sales_revenue_by_category_qtr IS
 'Positive payment revenue in the current calendar quarter AND year. Dynamic CURRENT_DATE; excludes categories with no sales or zero totals. Historical DVD Rental normally returns no current rows.';
 
--- TASK 3. Popularity = number of rental rows made by customers whose registered
--- address is in the requested country; not revenue or inventory count.
--- DENSE_RANK keeps ALL films tied for highest count in each country.
--- Match country names ignoring case/outer spaces; duplicate input names are removed.
--- Unknown/NULL/blank country => exception, not silent omission. Existing country
--- with no rentals => NOTICE and no row for that country. Other countries still return.
+-- Task 3: Rank films by rental count in each customer's country.
+-- Keep all ties and show NULL film details for countries without rentals.
 CREATE OR REPLACE FUNCTION core.most_popular_films_by_countries(p_countries text[])
 RETURNS TABLE(country text, film text, rating text, language text,
               length integer, release_year integer)
 LANGUAGE plpgsql STABLE
 SET search_path = pg_catalog
 AS $$
-DECLARE v_name text;
 BEGIN
     IF p_countries IS NULL OR cardinality(p_countries) = 0 THEN
         RAISE EXCEPTION 'Provide at least one country' USING ERRCODE = '22023';
     END IF;
-    FOREACH v_name IN ARRAY p_countries LOOP
-        IF v_name IS NULL OR btrim(v_name) = '' THEN
-            RAISE EXCEPTION 'Country cannot be NULL or blank' USING ERRCODE = '22023';
-        END IF;
-        IF NOT EXISTS (SELECT 1 FROM public.country c
-                       WHERE lower(c.country) = lower(btrim(v_name))) THEN
-            RAISE EXCEPTION 'Unknown country: %', v_name USING ERRCODE = '22023';
-        END IF;
-        IF NOT EXISTS (
-            SELECT 1 FROM public.country c
-            JOIN public.city ci ON ci.country_id = c.country_id
-            JOIN public.address a ON a.city_id = ci.city_id
-            JOIN public.customer cu ON cu.address_id = a.address_id
-            JOIN public.rental r ON r.customer_id = cu.customer_id
-            WHERE lower(c.country) = lower(btrim(v_name))) THEN
-            RAISE NOTICE 'No rental data for country: %', v_name;
-        END IF;
-    END LOOP;
+
+    IF EXISTS (
+        SELECT 1
+        FROM unnest(p_countries) AS n(name)
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM public.country c
+            WHERE lower(c.country) = lower(btrim(n.name))
+        )
+    ) THEN
+        RAISE EXCEPTION 'Country list contains an unknown, blank or NULL name'
+            USING ERRCODE = '22023';
+    END IF;
+
     RETURN QUERY
-    WITH counts AS (
-        SELECT c.country_id, c.country AS country_name, i.film_id, count(*) AS rentals
+    WITH requested AS (
+        SELECT c.country_id, c.country AS country_name
         FROM public.country c
-        JOIN public.city ci ON ci.country_id = c.country_id
+        WHERE EXISTS (
+            SELECT 1
+            FROM unnest(p_countries) AS n(name)
+            WHERE lower(c.country) = lower(btrim(n.name))
+        )
+    ), counts AS (
+        SELECT q.country_id, i.film_id, count(*) AS rentals
+        FROM requested q
+        JOIN public.city ci ON ci.country_id = q.country_id
         JOIN public.address a ON a.city_id = ci.city_id
         JOIN public.customer cu ON cu.address_id = a.address_id
         JOIN public.rental r ON r.customer_id = cu.customer_id
         JOIN public.inventory i ON i.inventory_id = r.inventory_id
-        WHERE EXISTS (SELECT 1 FROM unnest(p_countries) n(name)
-                      WHERE lower(btrim(n.name)) = lower(c.country))
-        GROUP BY c.country_id, c.country, i.film_id
+        GROUP BY q.country_id, i.film_id
     ), ranked AS (
-        SELECT counts.*, dense_rank() OVER
-            (PARTITION BY country_id ORDER BY rentals DESC) AS popularity
+        SELECT counts.*,
+               dense_rank() OVER (
+                   PARTITION BY counts.country_id ORDER BY counts.rentals DESC
+               ) AS popularity
         FROM counts
     )
-    SELECT r.country_name::text, f.title::text, f.rating::text,
-           btrim(l.name)::text, f.length::integer, f.release_year::integer
-    FROM ranked r
-    JOIN public.film f ON f.film_id = r.film_id
-    JOIN public.language l ON l.language_id = f.language_id
-    WHERE r.popularity = 1
-    ORDER BY r.country_name, f.title, f.film_id;
+    SELECT q.country_name::text, f.title::text, f.rating::text,
+           btrim(l.name), f.length::integer, f.release_year::integer
+    FROM requested q
+    LEFT JOIN ranked r ON r.country_id = q.country_id AND r.popularity = 1
+    LEFT JOIN public.film f ON f.film_id = r.film_id
+    LEFT JOIN public.language l ON l.language_id = f.language_id
+    ORDER BY q.country_name, f.title, f.film_id;
 END;
 $$;
-COMMENT ON FUNCTION core.most_popular_films_by_countries(text[]) IS
-'Highest rental-count films per requested customer country; returns all ties, deduplicates requested countries, validates names; missing rental history yields NOTICE and no row.';
 
--- TASK 4. One row per AVAILABLE inventory copy. An outstanding rental is ANY row
--- with return_date IS NULL. NOT EXISTS checks only outstanding rows, including
--- anomalous multiple open rentals; never confuse the most recent returned rental
--- with evidence that an older outstanding rental does not exist.
--- The example asks for customer/date although an available copy has no CURRENT
--- renter: these two columns explicitly mean the MOST RECENT HISTORICAL rental.
--- Never-rented copies have NULL customer_name/rental_date.
--- Source timestamptz is explicitly converted to a timestamp in the session time
--- zone; a timestamp source is unchanged. This preserves the existing return type
--- so CREATE OR REPLACE works after v1, without dropping dependencies.
--- ILIKE is case-insensitive: '%love%' matches LOVE anywhere; '_' matches one char.
--- The caller supplies the pattern; plain 'love' means exact (case-insensitive) title.
--- A trailing escape character is invalid and rejected explicitly.
--- Performance: leading '%' cannot use an ordinary btree title index. On large
--- installations consider pg_trgm + a GIN title index (not installed by this task).
--- Filter titles first; EXISTS may short-circuit; fetch one historical rental only
--- for qualifying copies. Useful indexes: rental(inventory_id,rental_date DESC)
--- and partial rental(inventory_id) WHERE return_date IS NULL; benchmark before DDL.
+COMMENT ON FUNCTION core.most_popular_films_by_countries(text[]) IS
+'Returns the most rented films per country, including ties. Countries without rentals have NULL film details. Invalid country names raise an error.';
+
+-- Task 4: ILIKE matches case-insensitively; % matches any text.
+-- A copy is available if it has no open rental. Leading % can require a title scan.
 CREATE OR REPLACE FUNCTION core.films_in_stock_by_title(p_pattern text)
 RETURNS TABLE(row_num bigint, film_title text, language text,
               customer_name text, rental_date timestamp without time zone)
@@ -167,38 +151,38 @@ SET search_path = pg_catalog
 AS $$
 BEGIN
     IF p_pattern IS NULL OR btrim(p_pattern) = '' THEN
-        RAISE EXCEPTION 'Title pattern cannot be NULL or blank' USING ERRCODE = '22023';
+        RAISE EXCEPTION 'Title pattern cannot be NULL or blank'
+            USING ERRCODE = '22023';
     END IF;
-    -- Ask PostgreSQL's LIKE engine to validate escape syntax even with no films.
-    PERFORM '' ILIKE p_pattern;
+
     RETURN QUERY
     SELECT row_number() OVER (ORDER BY f.title, i.inventory_id),
-           f.title::text, btrim(l.name)::text,
-           CASE WHEN h.customer_id IS NULL THEN NULL
-                ELSE cu.first_name || ' ' || cu.last_name END::text,
-           h.rental_date::timestamp without time zone
+           f.title::text,
+           btrim(l.name),
+           NULL::text,
+           NULL::timestamp without time zone
     FROM public.film f
     JOIN public.language l ON l.language_id = f.language_id
     JOIN public.inventory i ON i.film_id = f.film_id
-    LEFT JOIN LATERAL (
-        SELECT r.customer_id, r.rental_date
-        FROM public.rental r WHERE r.inventory_id = i.inventory_id
-        ORDER BY r.rental_date DESC, r.rental_id DESC LIMIT 1
-    ) h ON true
-    LEFT JOIN public.customer cu ON cu.customer_id = h.customer_id
     WHERE f.title ILIKE p_pattern
-      AND NOT EXISTS (SELECT 1 FROM public.rental r
-                      WHERE r.inventory_id = i.inventory_id AND r.return_date IS NULL)
+      AND NOT EXISTS (
+          SELECT 1
+          FROM public.rental r
+          WHERE r.inventory_id = i.inventory_id
+            AND r.return_date IS NULL
+      )
     ORDER BY f.title, i.inventory_id;
+
     IF NOT FOUND THEN
-        RAISE NOTICE 'No films currently in stock for pattern: %', p_pattern;
+        RETURN QUERY
+        SELECT 1::bigint, 'No films in stock found'::text,
+               NULL::text, NULL::text, NULL::timestamp without time zone;
     END IF;
-    -- Multiple matches return all copies; no matches => NOTICE + empty typed set.
-    -- A message is not inserted into a film-title column as if it were real data.
 END;
 $$;
+
 COMMENT ON FUNCTION core.films_in_stock_by_title(text) IS
-'ILIKE title pattern; one row per available copy, numbered from 1; customer/date describe last historical rental. No match => NOTICE and empty set. Blank/NULL pattern raises 22023.';
+'Returns one row per available copy matching the title pattern. If none match, returns one message row. Blank or NULL input raises an error.';
 
 -- TASK 5. A unique expression index enforces normalized title uniqueness even
 -- for concurrent/direct INSERTs, unlike an IF EXISTS check by itself.
@@ -387,14 +371,19 @@ DO $$ DECLARE v_country text := '__FUNC_HW_NO_RENTALS_'||txid_current(); BEGIN
         RAISE EXCEPTION 'Unknown country unexpectedly accepted';
     EXCEPTION WHEN invalid_parameter_value THEN RAISE NOTICE 'PASS Task 3: unknown country rejected'; END;
     INSERT INTO public.country(country) VALUES(v_country);
-    IF EXISTS(SELECT 1 FROM core.most_popular_films_by_countries(ARRAY[v_country])) THEN
-        RAISE EXCEPTION 'Country without rentals should yield no rows';
+        IF NOT EXISTS (
+        SELECT 1
+        FROM core.most_popular_films_by_countries(ARRAY[v_country]) AS result
+        WHERE result.country = v_country
+          AND result.film IS NULL
+    ) THEN
+        RAISE EXCEPTION 'Expected a country row with NULL film details';
     END IF;
 END $$;
 
 -- TASK 4 valid: sequential row numbers, correct five output columns; available copies.
 SELECT * FROM core.films_in_stock_by_title('%love%');
--- Expected 0 rows plus NOTICE (valid input, missing matching film).
+-- Expected: one result row with 'No films in stock found' in film_title. 
 SELECT * FROM core.films_in_stock_by_title('__FUNC_HW_NO_SUCH_TITLE__');
 DO $$ BEGIN
     BEGIN
