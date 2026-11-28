@@ -1,0 +1,62 @@
+Task 4 — PostgreSQL access control
+Author: Ruta Karulaite
+
+1. How can access to certain columns be restricted?
+Grant access to only the required columns. A table-wide SELECT granted
+directly, through another role, or to PUBLIC would still allow reading all
+columns; a column grant is not a restriction on a broader grant.
+Example (separate reporting role, assuming no broader grants):
+  CREATE ROLE customer_directory NOLOGIN;
+  GRANT USAGE ON SCHEMA public TO customer_directory;
+  GRANT SELECT (customer_id, first_name, last_name)
+    ON public.customer TO customer_directory;
+A support directory can display names while withholding email and other
+customer fields. RLS may be added independently to restrict rows.
+
+2. What is the difference between identification and authentication?
+Identification is claiming an identity; authentication verifies that claim.
+Example: in pgAdmin, entering rentaluser identifies the claimed role; a
+successful SCRAM password exchange authenticates it. Whether the role can
+then read public.customer is authorization, checked separately.
+Scenario: a rental employee signs in; PostgreSQL verifies the credential,
+then lets the employee read customer records only if granted SELECT.
+
+3. What authentication protocols are recommended?
+For passwords, use SCRAM-SHA-256 with TLS and server certificate verification
+for remote connections. For centrally managed or certificate-based setups,
+GSSAPI (Kerberos) or TLS client certificates can be suitable. Prefer SCRAM
+over legacy MD5 and do not use trust for untrusted clients.
+Example pg_hba.conf rule for a local TCP lab, if TLS is configured:
+  hostssl dvdrental rentaluser 127.0.0.1/32 scram-sha-256
+Place the rule before any conflicting broader rule; use the actual DB name.
+A client using verify-full must connect with a host name or IP matching the
+server certificate. Existing passwords must have SCRAM verifiers.
+Scenario: a branch office connects to a remote rental database and verifies
+the server certificate, while PostgreSQL verifies the employee's password.
+
+4. What is proxy authentication here?
+One common design is for a trusted application to authenticate end users and
+connect to PostgreSQL as a service role, then select an authorized database
+role for a transaction. SET ROLE changes the effective authorization role;
+it does not authenticate the end user. Some environments instead use an
+external authentication proxy, which is a separate component.
+Illustrative example, after an administrator grants the service role the
+right to SET ROLE to the chosen NOLOGIN client role:
+  BEGIN;
+  SET LOCAL ROLE client_mary_smith;
+  SELECT * FROM public.rental;
+  COMMIT;
+Use the actual client role from Tasks 2–3. session_user stays the service
+login; current_user becomes the client role during the transaction.
+Scenario: a rental portal validates its own user session, resolves that user
+to a server-controlled customer role, and reuses pooled DB connections.
+PostgreSQL can enforce grants and RLS without each portal user storing a DB
+password. The service must control role selection and must not accept raw
+SQL or arbitrary role names from end users.
+
+References:
+https://www.postgresql.org/docs/current/sql-grant.html
+https://www.postgresql.org/docs/current/auth-password.html
+https://www.postgresql.org/docs/current/auth-pg-hba-conf.html
+https://www.postgresql.org/docs/current/sql-set-role.html
+https://www.postgresql.org/docs/current/libpq-ssl.html
