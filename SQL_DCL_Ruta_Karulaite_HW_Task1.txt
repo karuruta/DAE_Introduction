@@ -1,0 +1,222 @@
+Task 1 — dvdrental security audit
+Author: Ruta Karulaite
+
+The audit was performed in pgAdmin on PostgreSQL 18.6 before applying
+the changes in Tasks 2–3.
+
+1. Database ownership, version and connection privileges
+
+SELECT current_database() AS database_name,
+       current_user AS connected_user,
+       current_setting('server_version') AS server_version;
+
+Evidence:
+database_name | connected_user | server_version
+dvdrental     | postgres       | 18.6
+
+SELECT datname, pg_get_userbyid(datdba) AS owner, datallowconn,
+       datconnlimit, datacl
+FROM pg_database
+WHERE datname = current_database();
+
+Evidence:
+datname   | owner    | datallowconn | datconnlimit | datacl
+dvdrental | postgres | true         | -1           | NULL
+
+The database accepts connections and has no database-specific
+connection limit. A NULL ACL means that default database privileges
+apply. The database owner and the role that ran the audit were both
+postgres.
+
+2. Existing users, roles, membership and database access
+
+SELECT rolname, rolcanlogin, rolsuper, rolcreaterole, rolcreatedb,
+       rolreplication, rolbypassrls, rolinherit, rolconnlimit,
+       has_database_privilege(oid, current_database(), 'CONNECT') AS can_connect
+FROM pg_roles
+ORDER BY rolname;
+
+Evidence: roles and login privileges
+
+The query returned 17 roles: postgres and 16 predefined PostgreSQL roles.
+postgres was the only role with rolcanlogin = true and rolsuper = true.
+It also had rolcreaterole, rolcreatedb, rolreplication, and rolbypassrls
+set to true. These attributes were false for all 16 predefined roles.
+
+All 17 roles had rolinherit = true, rolconnlimit = -1, and
+can_connect = true for dvdrental. A role with rolcanlogin = false
+cannot log in directly, even if it has the CONNECT privilege.
+
+SELECT granted.rolname AS granted_role, member.rolname AS member,
+       m.admin_option
+FROM pg_auth_members m
+JOIN pg_roles granted ON granted.oid = m.roleid
+JOIN pg_roles member ON member.oid = m.member
+ORDER BY 1, 2;
+
+Evidence: role memberships
+
+granted_role         | member     | admin_option
+pg_read_all_settings | pg_monitor | false
+pg_read_all_stats    | pg_monitor | false
+pg_stat_scan_tables  | pg_monitor | false
+
+The query returned three memberships, all involving predefined
+PostgreSQL monitoring roles. No custom role memberships were listed.
+All three memberships had admin_option = false, so none of these
+memberships allows pg_monitor to grant the corresponding role to others.
+
+3. Table and column privileges
+
+SELECT n.nspname AS schema_name, c.relname AS table_name,
+       pg_get_userbyid(c.relowner) AS owner,
+       CASE WHEN a.grantee = 0 THEN 'PUBLIC'
+            ELSE pg_get_userbyid(a.grantee)::text END AS grantee,
+       a.privilege_type, a.is_grantable
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+CROSS JOIN LATERAL aclexplode(
+    coalesce(c.relacl, acldefault('r', c.relowner))
+) a
+WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
+ORDER BY 1, 2, 4, 5;
+
+Evidence: table-level privileges
+
+The query returned 184 privilege rows for 23 tables in the public schema.
+All rows listed postgres as both owner and grantee. No table-level
+privileges were listed for PUBLIC or any other role.
+
+Result excerpt (grouped by table):
+Table           | Owner    | Grantee  | Privilege rows
+public.customer | postgres | postgres | 8
+public.rental   | postgres | postgres | 8
+public.payment  | postgres | postgres | 8
+
+Each of these tables listed DELETE, INSERT, MAINTAIN, REFERENCES,
+SELECT, TRIGGER, TRUNCATE, and UPDATE.
+The is_grantable column was false in all 184 result rows.
+
+SELECT table_name, column_name, grantee, privilege_type
+FROM information_schema.column_privileges
+WHERE table_schema = 'public'
+  AND table_name IN ('customer', 'rental', 'payment')
+ORDER BY 1, 2, 3, 4;
+
+Evidence: column privileges
+
+The query returned 92 privilege rows, all for postgres.
+
+Result summary:
+Table    | Columns covered | Privilege rows
+customer | 10              | 40
+rental   | 7               | 28
+payment  | 6               | 24
+
+Each of the 23 columns listed four privileges for postgres:
+INSERT, REFERENCES, SELECT, and UPDATE.
+
+The column_privileges view also reports table-level privileges as rows
+for individual columns. These results do not establish that privileges
+were granted separately on each column.
+
+4. Row-level security
+
+SELECT n.nspname, c.relname, c.relrowsecurity AS rls_enabled,
+       c.relforcerowsecurity AS force_rls
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
+ORDER BY 2;
+
+Evidence: row-level security status
+
+The query returned 23 tables in the public schema. All 23 had
+rls_enabled = false and force_rls = false.
+
+Result excerpt:
+Schema | Table    | rls_enabled | force_rls
+public | customer | false       | false
+public | rental   | false       | false
+public | payment  | false       | false
+
+SELECT *
+FROM pg_policies
+WHERE schemaname = 'public'
+ORDER BY tablename, policyname;
+
+Evidence: RLS policies
+
+The query returned 0 rows. No RLS policies were found in the public schema.
+If a role were granted table-wide SELECT on rental or payment, RLS would
+not limit it to a single customer's rows. The table privilege audit did
+not list such access for any grantee other than postgres.
+
+5. Connection and authentication settings
+
+SELECT name, setting
+FROM pg_settings
+WHERE name IN ('max_connections', 'password_encryption',
+               'ssl', 'listen_addresses')
+ORDER BY name;
+
+Evidence: server settings
+
+Setting             | Value
+listen_addresses    | *
+max_connections     | 100
+password_encryption | scram-sha-256
+ssl                 | off
+
+The server is configured to listen on all available IP interfaces.
+The server-wide connection limit is 100; dvdrental has no separate
+database-specific limit. New passwords are stored as SCRAM-SHA-256
+verifiers. PostgreSQL TLS is disabled.
+
+SELECT line_number, type, database, user_name, auth_method,
+       error IS NOT NULL AS parse_error
+FROM pg_hba_file_rules
+ORDER BY line_number;
+
+Evidence: client authentication rules
+
+Line | Type  | Database scope | User scope | Auth method   | Parse error
+113  | local | all            | all        | scram-sha-256 | false
+115  | host  | all            | all        | scram-sha-256 | false
+117  | host  | all            | all        | scram-sha-256 | false
+120  | local | replication    | all        | scram-sha-256 | false
+121  | host  | replication    | all        | scram-sha-256 | false
+122  | host  | replication    | all        | scram-sha-256 | false
+
+All six entries in the configuration file specify SCRAM-SHA-256.
+No parsing errors were reported. This view reports the current file
+contents, which may differ from the configuration last loaded by
+the server. The query did not show client address ranges.
+
+Conclusion
+
+The configuration is reasonable for an isolated training database, but it
+lacks role separation for routine use. The audit found SCRAM-SHA-256
+authentication rules and no table-level grants to PUBLIC on the 23 inspected
+tables. However, postgres was the only login role, and it was a superuser.
+Using it for routine queries creates unnecessary risk: for example, an
+accidental DELETE can remove records from a table that a routine user
+should only be able to read. Use a separate non-superuser login with only
+the privileges needed for routine work. Reserve postgres for administration.
+
+A second risk arises if remote TCP access is allowed. The server is
+configured to listen on all interfaces with TLS disabled. SCRAM protects
+password authentication, but does not encrypt query traffic. The audit
+did not establish whether remote clients can reach the server. For a
+local-only installation, restrict listening to localhost. If remote access
+is required, restrict allowed client networks and require TLS.
+
+Before granting customers access to rental or payment, enable RLS
+and verify that each customer can see only their own rows. The audit
+found no RLS policies in the public schema.
+
+References:
+https://www.postgresql.org/docs/18/view-pg-hba-file-rules.html
+https://www.postgresql.org/docs/18/auth-password.html
+https://www.postgresql.org/docs/18/ddl-priv.html
+https://www.postgresql.org/docs/18/ddl-rowsecurity.html
